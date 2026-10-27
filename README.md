@@ -1,1070 +1,178 @@
-# 🏆 k0t1k — AI Scoring for Agricultural Subsidies
+<div align="center">
 
-> **Solution for Decentrathon 5.0 | AI inDrive Gov Track**
+<h1>k0t1k — Subsidy Scoring</h1>
+<hr>
 
-[![English](https://img.shields.io/badge/🇬🇧English-README-blue)](README.md)
-[![Қазақша](https://img.shields.io/badge/🇰🇿Қазақша-README-blue)](README.kz.md)
-[![Русский](https://img.shields.io/badge/🇷🇺Русский-README-blue)](README.ru.md)
+**Merit-based scoring of agricultural subsidy applications for Kazakhstan: LightGBM ranking, per-applicant SHAP explanations, human reviewers decide**
 
----
+![PYTHON](https://img.shields.io/badge/PYTHON-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![FASTAPI](https://img.shields.io/badge/FASTAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)
+![LIGHTGBM](https://img.shields.io/badge/LIGHTGBM-4.5-9ACD32?style=flat-square)
+![POSTGRESQL](https://img.shields.io/badge/POSTGRESQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![REDIS](https://img.shields.io/badge/REDIS-7-DC382D?style=flat-square&logo=redis&logoColor=white)
+![LICENSE](https://img.shields.io/badge/LICENSE-PROPRIETARY-lightgrey?style=flat-square)
 
-## 📋 Table of Contents
+[Architecture](#architecture) · [Quick start](#quick-start) · [Docs](docs/) · English · [Русский](README.ru.md)
 
-- [About Project](#about-project)
-- [Problem Statement](#problem-statement)
-- [Solution](#solution)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [Tech Stack](#tech-stack)
-- [Machine Learning Model](#machine-learning-model)
-- [Data Sources](#data-sources)
-- [Quick Start](#quick-start)
-- [First Admin Setup](#first-admin-setup)
-- [Data Upload](#data-upload)
-- [API Endpoints](#api-endpoints)
-- [Explainability](#explainability)
-- [Security & Authentication](#security--authentication)
-- [Project Structure](#project-structure)
-- [Configuration](#configuration)
-- [Local Development](#local-development)
-- [Production Deployment](#production-deployment)
-- [Limitations & Known Issues](#limitations--known-issues)
-- [Evaluation Criteria](#evaluation-criteria)
-- [Team](#team)
-- [License](#license)
+</div>
 
----
+> [!NOTE]
+> This is a government subsidy scoring system (agriculture case, Decentrathon 5.0). It is not related to the `_k0t1k` Minecraft launcher.
 
-## 🎯 About Project
+## What it is
 
-**k0t1k** is an intelligent agricultural producer scoring system for distributing government subsidies in the Republic of Kazakhstan. The system was developed for **Decentrathon 5.0** hackathon as part of the **AI inDrive Gov** track.
+Agricultural subsidies in Kazakhstan are paid in order of application submission: whoever applies first gets funded until the budget runs out. k0t1k replaces that queue with a merit score. A two-stage pipeline (hard legal filters, then a LightGBM model) ranks applications and shows the reviewer which factors drove each score. The system only recommends; the final decision stays with a human reviewer.
 
-### Mission
+## Highlights
 
-Transition from the outdated **"first-come-first-served"** subsidy distribution principle to a **merit-based approach** — distribution based on actual farm efficiency data, legislative compliance, and growth potential.
+- 20-feature LightGBM model with a per-applicant SHAP explanation for every score and a weight simulation for commissions.
+- FastAPI backend with 37 endpoints (REST and SSE) across three routers: public/main API, auth, admin.
+- Async Excel to training pipeline: upload returns `202` with a `task_id`, training runs in the background, progress is kept in Redis, models are versioned and can be switched by an admin.
+- 5-service Docker Compose stack (PostgreSQL, Redis, backend, nginx frontend, Cloudflare Tunnel); 85 backend tests.
 
-### Stakeholders
+## Role
 
-- **Government employees** (Ministry of Agriculture, akimats)
-- **Analytical departments** and data specialists
-- **Agricultural producers** (subsidy recipients)
-- **Subsidy distribution commissions**
+Team lead, backend and ML, in a team of 2. **1st place at Decentrathon 5.0, GOV Case 2** (April 2026, organizer BAITC, KZT 2M team prize).
 
----
+## Technical stack
 
-## 🔥 Problem Statement
+| Layer | Technology |
+|-------|-----------|
+| Core | Python 3.12, FastAPI 0.115, Uvicorn, SQLAlchemy 2.0 (async) + asyncpg, Alembic, Pydantic 2 |
+| Data | PostgreSQL 16, Redis 7 (score/explanation cache, training progress, SSE stream tickets) |
+| ML | LightGBM 4.5, SHAP 0.46, scikit-learn 1.5, pandas, joblib (versioned model artifacts) |
+| LLM | Qwen via alem.plus (text explanations, chat), with a SHAP-based fallback when the API is unavailable |
+| Auth | JWT (python-jose), bcrypt, Google OAuth (optional), slowapi rate limits on upload and public endpoints |
+| Frontend | React 19, TypeScript 5.9, Vite 8, Tailwind CSS 4, Zustand, TanStack Table, Recharts; ru/kz interface |
+| Infra | Docker Compose, nginx (SPA + `/api/` proxy + SSE), Cloudflare Tunnel |
 
-### Current Situation
+## Architecture
 
-Government agricultural subsidies in Kazakhstan are distributed based on **application submission order**:
-
-```
-Farmer submitted first → Received funding (until budget runs out)
+```mermaid
+flowchart LR
+    U[Reviewer / Farmer / Admin] --> N[nginx :80<br/>SPA + /api proxy]
+    N --> B[FastAPI :8000]
+    B --> PG[(PostgreSQL 16)]
+    B --> R[(Redis 7)]
+    B --> M[LightGBM + SHAP<br/>versioned joblib models]
+    B --> L[alem.plus<br/>Qwen / embedder / reranker]
+    CF[Cloudflare Tunnel] --> N
 ```
 
-### Critical Problems
+Training flow for an uploaded Excel file:
 
-1. **❌ Efficiency Ignored**
-   - Actual farm efficiency is not considered
-   - Previous subsidy usage history is not analyzed
-   - Growth potential is not assessed
-
-2. **❌ Manipulation & Unfairness**
-   - Queue manipulation
-   - Non-transparent fund distribution
-   - Subsidies go to those who don't truly need them
-
-3. **❌ No Analytics**
-   - Decisions made without data-driven approach
-   - No automated compliance verification
-   - Manual application processing requires significant resources
-
-4. **❌ Regulatory Complexity**
-   - Multiple orders and regulations (Orders #11064, #12488, #108)
-   - Difficulty verifying all requirements manually
-
----
-
-## 💡 Solution
-
-### Concept
-
-**k0t1k** uses **machine learning (LightGBM)** to create a scoring model that:
-
-1. **Ranks applicants** based on comprehensive data analysis
-2. **Explains decisions** — which factors influenced the score (SHAP + LLM)
-3. **Generates shortlist** of candidates for commission review
-4. **Maintains human control** — final decision rests with expert
-
-### Key Principles
-
-```
-┌─────────────────────────────────────────────────────┐
-│  AI RECOMMENDS                                      │
-│  ↓                                                  │
-│  • Analyzes data                                    │
-│  • Calculates scoring (0-100)                       │
-│  • Explains decision factors                        │
-│  • Warns about violations                           │
-│                                                     │
-│  HUMAN DECIDES                                      │
-│  ↓                                                  │
-│  • Reviews AI recommendations                       │
-│  • Applies expert judgment                          │
-│  • Makes final decision                             │
-│  • Bears responsibility                             │
-└─────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant A as Admin
+    participant API as FastAPI
+    participant BG as Background task
+    participant R as Redis
+    participant DB as PostgreSQL
+    A->>API: POST /api/data/upload (xlsx)
+    API->>API: validate columns, numeric types, row minimum
+    API-->>A: 202 + task_id
+    API->>BG: start pipeline
+    BG->>BG: feature engineering, LightGBM training (thread pool)
+    BG->>BG: save versioned model, activate it
+    BG->>DB: batch upsert on application_number
+    BG->>R: progress, invalidate score cache
+    A->>API: GET /api/upload/status/{task_id}
+    API->>R: read progress
+    API-->>A: status, progress
 ```
 
----
+### Scoring and explainability
 
-## ✨ Key Features
+1. Hard filters reject applications that break legal rules (amount and rate bounds, pasture load per Order No. 11064).
+2. The LightGBM classifier scores the rest; the target `is_merit_worthy` encodes mortality norms (Order No. 12488), amount per head and pasture compliance.
+3. SHAP gives per-feature contributions for each application; Qwen turns them into text, streamed over SSE. If the LLM times out, a SHAP-based text is returned instead.
+4. Weight simulation, budget simulation and FIFO-vs-merit comparison let a commission test alternative policies before deciding.
 
-### 🤖 ML Scoring
+### Decisions
 
-- **LightGBM model** with 20 features for efficiency assessment
-- **Two-stage scoring**: hard filters + ML model
-- **Target leakage protection** via fit/transform separation
-- **5-fold cross-validation** to confirm quality
+| Decision | Reason |
+|----------|--------|
+| Training in a FastAPI background task, progress in Redis | No queue infrastructure to run; the request returns immediately, the client polls `GET /api/upload/status/{task_id}` |
+| One-time SSE stream tickets (60 s TTL in Redis) | The browser `EventSource` cannot send an `Authorization` header; a ticket keeps the JWT out of URLs |
+| SHAP with LLM text on top, with fallback | The explanation stays correct without the LLM; the LLM only rewrites it in plain language |
+| Versioned model files, activated by admin | A new training run does not replace the serving model until an admin switches to it |
 
-### 📊 Explainability
+## Project structure
 
-- **SHAP values** — local explanation for each application
-- **Global feature importance** — overall model understanding
-- **LLM explanations** (Qwen 3.5) — text description in plain language
-- **Streaming explanations** via Server-Sent Events (SSE)
-
-### 📈 Analytics
-
-- **FIFO vs Merit comparison** — visual demonstration of advantages
-- **Budget simulation** — merit-based fund distribution
-- **Weight simulation** — feature weight adjustment for commissions
-- **Fairness audit** — regional bias verification (Gini index, CV)
-- **Transparency Report** — public decision transparency report
-
-### 🛡️ Anti-Fraud System
-
-- **Collusion detection** — identical amounts/areas in districts
-- **Night submissions** — anomalous application timing
-- **New farms** — suspiciously new operations
-- **Extreme amounts** — anomalously high requests
-
-### 📄 Documentation
-
-- **PDF protocols** — commission decision protocol (Cyrillic support)
-- **PDF budgets** — budget fund distribution
-- **PDF refusals** — refusal notifications with reason explanations
-
-### 🌐 Multilingual Support
-
-- **Russian language** — full interface
-- **Kazakh language** — full interface
-- **LLM explanations** in both languages
-
-### 👤 Farmer Portal
-
-- **Public application submission** — no authentication required
-- **Status checking** — track application by number
-- **Proactive offers** — AI finds promising farmers
-- **Guides** — application assistance
-
-### 👨‍💼 Admin Panel
-
-- **User management** — activation, blocking, admin rights
-- **Model management** — versioning, activating different models
-- **Data upload** — Excel upload with automatic training
-- **Analytics dashboard** — statistics, filters, charts
-
----
-
-## 🏗️ System Architecture
-
-```
-┌───────────────────────────────────────────────────────────┐
-│                        Users                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │ Official │  │ Analyst  │  │  Farmer  │  │  Admin   │ │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘ │
-└───────┼─────────────┼─────────────┼─────────────┼────────┘
-        │             │             │             │
-        └─────────────┴─────────────┴─────────────┘
-                      │
-                 ┌────▼────┐
-                 │  Nginx  │  Port 80
-                 │  (SPA + │  • React frontend
-                 │  Proxy) │  • Proxy /api/ → backend:8000
-                 └────┬────┘  • SSE support
-                      │
-        ┌─────────────┴─────────────┐
-        │                           │
-   ┌────▼────┐              ┌───────▼──────┐
-   │Frontend │              │   Backend    │
-   │ React + │              │   FastAPI    │  Port 8000
-   │TypeScript│              │   + Uvicorn  │
-   │  Vite   │              └───────┬──────┘
-   │Tailwind │                      │
-   └─────────┘          ┌───────────┼───────────┐
-                        │           │           │
-                  ┌─────▼────┐ ┌───▼────┐ ┌───▼────┐
-                  │PostgreSQL│ │ Redis  │ │  ML    │
-                  │  Port    │ │ Port   │ │Models  │
-                  │  5432    │ │ 6379   │ │LightGBM│
-                  └──────────┘ └────────┘ └────────┘
+```text
+.
+├── backend/
+│   ├── app/api/            # endpoints, auth_router, admin_router
+│   ├── app/ml/             # features, model (LightGBM), SHAP explainer
+│   ├── app/services/       # scoring pipeline, PDF, proactive offers
+│   ├── app/core/           # config, auth, redis, legal norms (laws.py)
+│   ├── app/integrations/   # alem.plus client
+│   ├── alembic/            # migrations 001-005
+│   └── tests/              # 85 pytest tests
+├── frontend/src/           # pages, components, i18n (ru, kz), stores
+├── scripts/                # synthetic farm-feature generator
+├── docs/                   # architecture, ML pipeline, API reference, deployment
+└── docker-compose.yml
 ```
 
----
+## Quick start
 
-## 🛠️ Tech Stack
-
-### Backend
-
-| Technology | Version | Purpose |
-|------------|--------|---------|
-| **Python** | 3.11+ | Development language |
-| **FastAPI** | 0.115.0 | Async web framework |
-| **Uvicorn** | - | ASGI server |
-| **SQLAlchemy** | 2.0 | ORM (async mode) |
-| **asyncpg** | - | Async PostgreSQL driver |
-| **Alembic** | 1.13.0 | DB migrations |
-| **PostgreSQL** | 16 | Primary database |
-| **Redis** | 7 | Caching |
-| **LightGBM** | 4.5.0 | ML model (classifier) |
-| **SHAP** | 0.46.0 | Model explainability |
-| **scikit-learn** | 1.5.0 | ML utilities |
-| **pandas** | 2.2.0 | Data processing |
-| **numpy** | 1.26.0 | Numerical operations |
-| **Qwen 3.5** | - | LLM for explanations (alem.plus) |
-| **Score API** | - | Semantic verification (alem.plus) |
-| **Embedder** | text-1024 | Text vectorization (alem.plus) |
-| **python-jose** | - | JWT tokens |
-| **bcrypt** | - | Password hashing |
-| **slowapi** | - | Rate limiting |
-| **fpdf2** | - | PDF generation (Cyrillic) |
-
-### Frontend
-
-| Technology | Version | Purpose |
-|------------|--------|---------|
-| **React** | 19 | UI framework |
-| **TypeScript** | 5.9 | Type safety |
-| **Vite** | 8 | Bundler |
-| **TailwindCSS** | 4 | Styling |
-| **React Router** | 7 | Routing |
-| **Zustand** | 5 | State management |
-| **TanStack Table** | 8 | Paginated tables |
-| **Recharts** | 3 | Charts |
-| **Axios** | 1.14 | HTTP client |
-| **Lucide React** | 1.7 | Icons |
-
-### DevOps
-
-| Technology | Purpose |
-|------------|---------|
-| **Docker** | Containerization |
-| **Docker Compose** | Service orchestration |
-| **Nginx** | Reverse proxy + SPA server |
-| **Cloudflare Tunnel** | Secure external access |
-
----
-
-## 🧠 Machine Learning Model
-
-### Features (20 total)
-
-#### Numeric (13)
-
-| Feature | Description | Source |
-|---------|-------------|--------|
-| `head_count` | Number of heads (amount / normativ) | Computed |
-| `month` | Application month | Temporal |
-| `hour` | Application hour | Temporal |
-| `day_of_week` | Application day of week | Temporal |
-| `amount_per_head` | Subsidy per head | Computed |
-| `subsidy_type_approval_rate` | Historical approval rate | Aggregated |
-| `amount_vs_region_median` | Deviation from region median | Aggregated |
-| `amount_vs_subsidy_median` | Deviation from subsidy median | Aggregated |
-| `normativ_amount_ratio` | Normativ to amount ratio | Computed |
-| `direction_competition` | Competition by direction | Aggregated |
-| `amount_log` | Log-transformed amount | Computed |
-| `pasture_area_ha` | Pasture area (ha) | Farmer Portrait |
-| `historical_mortality_rate` | Historical mortality (%) | Farmer Portrait |
-| `current_head_count` | Current head count | Farmer Portrait |
-
-#### Binary (3)
-
-| Feature | Description |
-|---------|-------------|
-| `is_cooperative` | Is cooperative |
-| `is_breeding` | Breeding farm |
-| `is_import` | Livestock import |
-
-#### Categorical (3)
-
-| Feature | Categories |
-|---------|-----------|
-| `animal_type` | Cattle, milk, sheep, horses, other |
-| `subsidy_category` | Acquisition, price reduction, breeding, other |
-| `normativ_tier` | low, mid, high, zero |
-
-### Target Variable
-
-**`is_merit_worthy`** — binary feature (0/1), determined by three criteria:
-
-1. **Livestock mortality ≤ norm** (Order #12488)
-   - Depends on animal type
-   - Dynamic thresholds from `laws.py`
-
-2. **Subsidy efficiency** (Order #108)
-   - Amount per head ≤ 5,000,000 KZT
-   - Reasonable fund usage
-
-3. **Pasture norm compliance** (Order #11064)
-   - Pasture area sufficient for herd size
-   - Depends on animal type and region
-
-### LightGBM Hyperparameters
-
-```python
-LGBMClassifier(
-    n_estimators=500,
-    max_depth=7,
-    learning_rate=0.05,
-    num_leaves=63,
-    min_child_samples=50,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    scale_pos_weight=auto_calculated,
-    random_state=42
-)
-```
-
-### Validation
-
-- **Train/Test Split**: 80/20 (stratified)
-- **Cross-Validation**: 5-fold StratifiedKFold
-- **Early Stopping**: 50 rounds
-- **Metrics**: Accuracy, Precision, Recall, F1, ROC-AUC
-
----
-
-## 📊 Data Sources
-
-### Primary Dataset
-
-**Source**: Government information system (GISS) export
-
-**Format**: Excel (.xlsx)
-
-**Structure** (13 columns from export):
-
-| # | Column | Type | Description |
-|---|--------|------|-------------|
-| 1 | `sequential_number` | Integer | Application sequence number |
-| 2 | `submission_date` | DateTime | Submission date and time |
-| 3 | `region` | String | Oblast (Abai, Akmola, etc.) |
-| 4 | `akimat` | String | Akimat name |
-| 5 | `application_number` | String | Unique application number (14 digits) |
-| 6 | `direction` | String | Direction (livestock, crops, etc.) |
-| 7 | `subsidy_name` | Text | Full subsidy name |
-| 8 | `status` | String | Status (Executed, Withdrawn, etc.) |
-| 9 | `normativ` | Float | Subsidy rate (KZT/unit) |
-| 10 | `amount` | Float | Total amount (KZT) |
-| 11 | `farm_district` | String | Farm district |
-| 12 | `farmer_name` | String | Farmer name (optional) |
-| 13 | `land_area` | Float | Land area (ha) |
-
-### Synthetic Data (Farmer Portrait)
-
-**Problem**: Real export contains only application data. Scoring requires farm data.
-
-**Solution**: Generate synthetic features based on real data + legislative norms
-
-**Script**: `scripts/generate_synthetic_features.py`
-
-#### Generated Features
-
-| Feature | Generation Method | Justification |
-|---------|-------------------|---------------|
-| `pasture_area_ha` | Based on herd count × ha/head norm + noise | Order #11064 (maximum pasture loads) |
-| `historical_mortality_rate` | Based on animal type + mortality norm | Order #12488 (natural offspring) |
-| `current_head_count` | Based on requested quantity + multiplier | Realistic farm sizes |
-
-#### Legislative Norms (laws.py)
-
-**Order #11064** — Maximum pasture loads:
-
-| Animal Type | ha/head |
-|-------------|---------|
-| Cattle (beef) | 1.0 |
-| Cattle (dairy) | 1.5 |
-| Sheep | 0.1 |
-| Horses | 1.2 |
-
-**Order #12488** — Mortality norms:
-
-| Animal Type | Mortality Norm (%) |
-|-------------|-------------------|
-| Cattle | 8-10% |
-| Sheep | 12-15% |
-| Horses | 5-7% |
-| Poultry | 15-20% |
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- **Docker** (version 20.10+)
-- **Docker Compose** (version 2.0+)
-- **Git**
-- **Minimum 8 GB RAM** (for ML model)
-- **API keys** from alem.plus (LLM, Score API, Embedder)
-
-### Step-by-Step Guide
-
-#### Step 1: Clone Repository
+Requires Docker with Compose v2 and alem.plus API keys for the LLM features.
 
 ```bash
-git clone https://github.com/your-username/k0t1k.git
-cd k0t1k
-```
-
-#### Step 2: Configure Environment
-
-```bash
-# Copy template
-cp .env.example .env
-
-# Edit .env
-# Required:
-# - LLM_API_KEY (from alem.plus)
-# - SCORE_API_KEY (from alem.plus)
-# - EMBEDDER_API_KEY (from alem.plus)
-# - JWT_SECRET_KEY (any secret string)
-# - GOOGLE_CLIENT_ID (optional)
-```
-
-**Minimal .env for local run**:
-
-```env
-POSTGRES_DB=k0t1k
-POSTGRES_USER=k0t1k
-POSTGRES_PASSWORD=k0t1k_local
-
-LLM_API_KEY=your-alem-plus-key
-SCORE_API_KEY=your-alem-plus-key
-EMBEDDER_API_KEY=your-alem-plus-key
-
-JWT_SECRET_KEY=my-super-secret-key-123
-```
-
-#### Step 3: Run via Docker Compose
-
-```bash
-# Start all services
-docker compose up --build
-
-# Or in background mode
+git clone https://github.com/hhhhhffd/dc-5.0-win-project.git
+cd dc-5.0-win-project
+cp .env.example .env   # fill in the keys
 docker compose up --build -d
-```
-
-**What happens on startup**:
-
-1. ✅ Docker images built (backend + frontend)
-2. ✅ PostgreSQL started (port 5432)
-3. ✅ Redis started (port 6379)
-4. ✅ Alembic migrations applied
-5. ✅ Backend FastAPI started (port 8000)
-6. ✅ Nginx Frontend started (port 80)
-7. ✅ (Optional) Cloudflare Tunnel
-
-#### Step 4: Verify Operation
-
-```bash
-# Check backend health
 curl http://localhost:8000/api/health
-
-# Expected response:
-{
-  "status": "ok",
-  "model_loaded": true,
-  "redis_connected": true,
-  "llm_available": true
-}
-
-# Check Frontend
-# Open in browser: http://localhost
 ```
 
-#### Step 5: Register First User
+The UI is at `http://localhost`, Swagger at `http://localhost:8000/docs`.
+
+First admin: register through the UI or API, then promote the account in the `postgres` service.
 
 ```bash
-# Register via API
-curl -X POST http://localhost:80/api/auth/register \
+curl -X POST http://localhost/api/auth/register \
   -H "Content-Type: application/json" \
-  -d '{
-    "email": "admin@admin.com",
-    "password": "admin123",
-    "full_name": "Administrator"
-  }'
-```
+  -d '{"email": "<email>", "password": "<password>", "full_name": "<name>"}'
 
-#### Step 6: Grant Admin Rights
-
-```bash
-# Method 1: Via SQL (recommended)
 docker compose exec postgres psql -U k0t1k -d k0t1k -c \
-  "UPDATE users SET is_admin = True, is_active = True WHERE email = 'admin@admin.com';"
-
-# Method 2: Interactive psql
-docker compose exec postgres psql -U k0t1k -d k0t1k
-
-# Inside psql:
-UPDATE users SET is_admin = true, is_active = true WHERE email = 'admin@admin.com';
-\q
-
-# Method 3: Verify result
-docker compose exec postgres psql -U k0t1k -d k0t1k -c \
-  "SELECT id, email, is_admin, is_active FROM users WHERE email = 'admin@admin.com';"
+  "UPDATE users SET is_admin = true, is_active = true WHERE email = '<email>';"
 ```
 
-> **⚠️ Important**: Depending on DB configuration, database name may be `k0t1k` instead of `k0t1k_db`. Check `POSTGRES_DB` value in `.env` file.
+> [!WARNING]
+> Set `JWT_SECRET_KEY` and `POSTGRES_PASSWORD` before any non-local run. If `JWT_SECRET_KEY` is empty, a random key is generated on every start and all tokens are invalidated on restart.
 
-#### Step 7: Login
+Tests: `cd backend && pip install -r requirements.txt && pytest`.
 
-1. Open **http://localhost**
-2. Enter email: `admin@admin.com`
-3. Enter password: `admin123`
-4. You're in the admin panel! 🎉
+<details>
+<summary>Environment variables (from .env.example)</summary>
 
----
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `POSTGRES_DB` / `POSTGRES_USER` | `k0t1k` | Database name and user |
+| `POSTGRES_PASSWORD` | `k0t1k_local` | Database password |
+| `REDIS_URL` | `redis://localhost:6379/0` | Overridden by compose |
+| `LLM_BASE_URL` | `https://llm.alem.ai/v1` | Qwen endpoint |
+| `LLM_API_KEY` | placeholder | LLM key |
+| `LLM_MODEL` | `qwen3` | Model name |
+| `EMBEDDER_URL` / `EMBEDDER_API_KEY` / `EMBEDDER_MODEL` | `https://llm.alem.ai/v1` / placeholder / `text-1024` | Embedder |
+| `SCORE_API_URL` / `SCORE_API_KEY` | `https://reranker-llm.alem.ai/v1` / placeholder | Reranker |
+| `JWT_SECRET_KEY` | placeholder | JWT signing key |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | empty | Optional Google OAuth |
+| `CORS_ORIGINS` | `["http://localhost:80","http://localhost:5173"]` | Allowed origins |
+| `CLOUDFLARE_TUNNEL_TOKEN` | placeholder | Optional tunnel |
 
-## 👑 First Admin Setup
+</details>
 
-### Complete First Run Script
+## Limitations
 
-```bash
-#!/bin/bash
-# first-admin.sh — First administrator setup script
+- Farm-level features (pasture area, mortality, herd size) are generated synthetically from the real application export and legal norms (`scripts/generate_synthetic_features.py`). The target is derived from rules over the same inputs, so model metrics measure rule recovery and are not quoted as real-world accuracy.
+- LLM text needs the alem.plus API; without it the SHAP-based fallback is used.
+- Training runs in-process on one server.
 
-echo "🚀 Setting up k0t1k first admin"
-echo "=========================================="
+More detail: [ARCHITECTURE](docs/ARCHITECTURE.md), [ML pipeline](docs/ML_PIPELINE.md), [API reference](docs/API_REFERENCE.md), [Deployment](docs/DEPLOYMENT.md), [Data sources](docs/DATA_SOURCES.md).
 
-# 1. Check services are running
-echo "📡 Checking services..."
-docker compose ps | grep -q "backend" || { echo "❌ Backend not started!"; exit 1; }
-docker compose ps | grep -q "postgres" || { echo "❌ PostgreSQL not started!"; exit 1; }
-echo "✅ Services running"
+## License
 
-# 2. Register user
-echo ""
-echo "📝 Registering user..."
-curl -s -X POST http://localhost:80/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "admin@admin.com",
-    "password": "admin123",
-    "full_name": "Main Administrator"
-  }' || echo "⚠️ User already exists"
-
-# 3. Grant admin rights
-echo ""
-echo "🔑 Granting admin rights..."
-docker compose exec postgres psql -U k0t1k -d k0t1k -c \
-  "UPDATE users SET is_admin = true, is_active = true WHERE email = 'admin@admin.com';"
-
-# 4. Verify
-echo ""
-echo "✅ Verifying rights..."
-docker compose exec postgres psql -U k0t1k -d k0t1k -c \
-  "SELECT id, email, full_name, is_admin, is_active FROM users WHERE email = 'admin@admin.com';"
-
-echo ""
-echo "🎉 Done! Login at http://localhost with credentials:"
-echo "   Email: admin@admin.com"
-echo "   Password: admin123"
-```
-
----
-
-## 📥 Data Upload
-
-### Preparing Dataset
-
-#### Option 1: Using Real Data
-
-1. Obtain GISS export (Excel .xlsx format)
-2. Ensure file contains standard columns (13 columns, see "Data Sources" section)
-3. Place file in `backend/data/raw/`
-
-#### Option 2: Generate Synthetic Data
-
-```bash
-# Generate enriched dataset
-docker compose exec backend python scripts/generate_synthetic_features.py
-
-# Script:
-# 1. Reads real export
-# 2. Adds Farmer Portrait features
-# 3. Calculates is_merit_worthy
-# 4. Saves to backend/data/raw/enriched_data_2025_merit.xlsx
-```
-
-### Upload via Web Interface
-
-1. Login as administrator
-2. Navigate to **Dashboard**
-3. Click **"Upload Excel"**
-4. Select file (.xlsx)
-5. Click **"Upload & Train"**
-
-**What happens**:
-
-```
-[HTTP 202] Upload accepted → background task started
-   ↓
-[Task ID] task_id returned for tracking
-   ↓
-[Progress] GET /api/upload/status/{task_id}
-   ↓
-[Done] Model trained, applications scored, cache updated
-```
-
-### Upload via API
-
-```bash
-# Upload file
-curl -X POST http://localhost:80/api/data/upload \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -F "file=@backend/data/raw/enriched_data_2025_merit.xlsx"
-
-# Expected response:
-{
-  "task_id": "abc123-def456-ghi789",
-  "message": "Upload accepted, training started"
-}
-
-# Track progress
-curl http://localhost:80/api/upload/status/abc123-def456-ghi789
-
-# Expected response:
-{
-  "status": "processing",  # or "completed"
-  "progress": 0.75,
-  "message": "Training model..."
-}
-```
-
----
-
-## 🔌 API Endpoints
-
-### Health Check
-
-```
-GET /api/health
-```
-
-### Authentication
-
-```
-POST /api/auth/register       # Register
-POST /api/auth/login          # Login
-POST /api/auth/google         # Google OAuth
-GET  /api/auth/me             # Current user
-POST /api/auth/change-password # Change password
-```
-
-### Data & Training
-
-```
-POST /api/data/upload                  # Upload Excel
-GET  /api/upload/status/{task_id}      # Training status
-```
-
-### Applications
-
-```
-GET /api/applications                  # List applications
-GET /api/applications/{id}             # Application details
-GET /api/applications/{id}/explain     # SHAP + LLM explanation
-GET /api/applications/{id}/explain-stream  # SSE explanation
-GET /api/applications/{id}/pdf         # PDF protocol
-GET /api/applications/{id}/refusal-pdf # PDF refusal
-```
-
-### Analytics
-
-```
-GET  /api/stats                        # Statistics
-GET  /api/global-shap                  # Global SHAP
-GET  /api/analytics/fifo-vs-merit      # FIFO vs Merit
-POST /api/analytics/simulate-weights   # Weight simulation
-GET  /api/analytics/transparency-report # Transparency Report
-GET  /api/data-quality                 # Data quality
-GET  /api/fairness                     # Fairness audit
-GET  /api/model-info                   # Model info
-```
-
-### Budget
-
-```
-POST /api/budget-simulate              # Budget simulation
-POST /api/budget-simulate/pdf          # Budget PDF
-```
-
-### AI Assistant
-
-```
-POST /api/assistant/chat               # Chat with assistant
-POST /api/assistant/chat-stream        # Streaming chat
-```
-
-### Proactive Offers
-
-```
-GET /api/proactive-offers              # Promising farmers
-```
-
-### Administration
-
-```
-GET  /api/admin/users                  # List users
-POST /api/admin/users/{id}/toggle-active  # Activate/Block
-POST /api/admin/users/{id}/toggle-admin   # Admin rights
-GET  /api/admin/models                 # Model versions
-POST /api/admin/models/{filename}/activate # Activate model
-```
-
-### Full API Documentation
-
-After startup, open: **http://localhost:8000/docs** (Swagger UI)
-
----
-
-## 🧠 Explainability
-
-### Why It Matters
-
-Per inDrive Gov requirements:
-
-> **"AI must not act as the sole source of truth. The system should assist in decision-making, not replace the expert."**
-
-### Explainability Levels
-
-#### Level 1: Score (0-100)
-
-```json
-{
-  "application_id": 12345,
-  "merit_score": 78.5,
-  "is_approved": true,
-  "risk_level": "green"
-}
-```
-
-#### Level 2: SHAP Values
-
-```json
-{
-  "shap_values": {
-    "amount_per_head": +12.3,
-    "pasture_area_ha": +8.7,
-    "historical_mortality_rate": -5.2,
-    "subsidy_type_approval_rate": +3.1
-  },
-  "top_positive": ["amount_per_head", "pasture_area_ha"],
-  "top_negative": ["historical_mortality_rate"]
-}
-```
-
-#### Level 3: LLM Explanation (Qwen 3.5)
-
-```
-This application received a score of 78.5 out of 100.
-
-✅ Positive factors:
-• Subsidy efficiency: amount per head is 2.3M KZT, 
-  which is within reasonable limits (below 5M threshold)
-• Pasture area is sufficient for declared herd size (complies with 
-  Order #11064)
-• Historical approval rate for this subsidy type: 85%
-
-⚠️ Risk factors:
-• Livestock mortality rate (5.2%) slightly exceeds norm for cattle (8%), 
-  but remains within acceptable limits
-
-Recommendation: Application meets merit-based scoring criteria.
-```
-
----
-
-## 🔐 Security & Authentication
-
-### Authentication Methods
-
-1. **Email + Password** (JWT tokens)
-2. **Google OAuth** (optional)
-
-### JWT Tokens
-
-```python
-# Authorization header
-Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
-
-# Token lifetime: 24 hours (configurable in config.py)
-```
-
-### User Roles
-
-| Role | Permissions |
-|------|-------------|
-| **Inactive** | No access (awaiting admin approval) |
-| **User** | View applications, explanations, analytics |
-| **Administrator** | Everything + user management, data upload, models |
-
-### Rate Limiting
-
-```
-Brute-force protection:
-- Login: 5 attempts per minute
-- API: 100 requests per minute
-- Explanations: 20 per minute (LLM is expensive!)
-```
-
----
-
-## 📁 Project Structure
-
-```
-k0t1k/
-├── 📄 README.md                          # English documentation
-├── 📄 README.ru.md                       # Russian documentation
-├── 📄 README.kz.md                       # Kazakh documentation
-├── 📄 docs/
-│   ├── ARCHITECTURE.md                   # System architecture
-│   ├── DATA_SOURCES.md                   # Data sources
-│   ├── ML_PIPELINE.md                    # ML pipeline
-│   ├── API_REFERENCE.md                  # API reference
-│   └── DEPLOYMENT.md                     # Deployment
-│
-├── 📂 backend/
-│   ├── 📄 Dockerfile
-│   ├── 📄 requirements.txt
-│   ├── 📄 alembic.ini
-│   │
-│   ├── 📂 app/
-│   │   ├── 📄 main.py                    # FastAPI entry point
-│   │   ├── 📂 api/                       # API endpoints
-│   │   ├── 📂 core/                      # Core utilities
-│   │   ├── 📂 db/                        # Database models
-│   │   ├── 📂 ml/                        # ML models & features
-│   │   ├── 📂 integrations/              # External APIs
-│   │   ├── 📂 schemas/                   # Pydantic schemas
-│   │   └── 📂 services/                  # Business logic
-│   │
-│   ├── 📂 alembic/                       # Database migrations
-│   ├── 📂 models/                        # Saved ML models
-│   ├── 📂 data/                          # Excel datasets
-│   └── 📂 tests/                         # Unit tests
-│
-├── 📂 frontend/
-│   ├── 📄 Dockerfile
-│   ├── 📄 package.json
-│   │
-│   └── 📂 src/
-│       ├── 📂 pages/                     # React pages
-│       ├── 📂 components/                # React components
-│       ├── 📂 services/                  # API client
-│       ├── 📂 store/                     # State management
-│       └── 📂 i18n/                      # Internationalization
-│
-├── 📂 scripts/
-│   └── 📄 generate_synthetic_features.py # Farmer Portrait generation
-│
-├── 📄 docker-compose.yml                 # Service orchestration
-├── 📄 .env.example                       # Environment template
-└── 📄 LICENSE
-```
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables (.env)
-
-#### Required
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `POSTGRES_DB` | Database name | `k0t1k` |
-| `POSTGRES_USER` | Database user | `k0t1k` |
-| `POSTGRES_PASSWORD` | Database password | `k0t1k_local` |
-| `LLM_API_KEY` | LLM key (alem.plus) | `your-key` |
-| `SCORE_API_KEY` | Score API key | `your-key` |
-| `EMBEDDER_API_KEY` | Embedder key | `your-key` |
-| `JWT_SECRET_KEY` | JWT secret | `random-string` |
-
-#### Optional
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LLM_BASE_URL` | LLM API URL | `https://llm.alem.ai/v1` |
-| `LLM_MODEL` | LLM model | `qwen3` |
-| `GOOGLE_CLIENT_ID` | Google OAuth ID | `` |
-| `CORS_ORIGINS` | Allowed CORS | `["http://localhost:80"]` |
-| `CLOUDFLARE_TUNNEL_TOKEN` | Cloudflare token | `` |
-
----
-
-## 💻 Local Development
-
-### Backend
-
-```bash
-cd backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Start PostgreSQL and Redis (Docker)
-docker compose up postgres redis -d
-
-# Run migrations
-alembic upgrade head
-
-# Start server
-uvicorn app.main:app --reload --port 8000
-
-# Run tests
-pytest
-```
-
-### Frontend
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Start dev server
-npm run dev
-
-# Build
-npm run build
-
-# Lint
-npm run lint
-```
-
----
-
-## 🚀 Production Deployment
-
-### Production Checklist
-
-- [ ] Replace `JWT_SECRET_KEY` with cryptographically secure value
-- [ ] Set `POSTGRES_PASSWORD` (don't use default)
-- [ ] Provide real `LLM_API_KEY`, `SCORE_API_KEY`, `EMBEDDER_API_KEY`
-- [ ] Configure `CORS_ORIGINS` for production domain
-- [ ] Enable HTTPS (Cloudflare or Nginx + Let's Encrypt)
-- [ ] Configure PostgreSQL backups
-- [ ] Set up monitoring (Prometheus + Grafana)
-- [ ] Configure logging (ELK Stack)
-
-### Deploy to Server
-
-```bash
-# 1. Clone
-git clone https://github.com/your-org/k0t1k.git
-cd k0t1k
-
-# 2. Configure
-cp .env.example .env
-nano .env  # Fill with real values
-
-# 3. Deploy
-docker compose up --build -d
-
-# 4. Verify
-docker compose ps
-curl http://localhost/api/health
-
-# 5. Create admin
-# (see "First Admin Setup" section)
-```
-
----
-
-## ⚠️ Limitations & Known Issues
-
-### Current Limitations
-
-1. **Synthetic Data**
-   - Farmer Portrait features are generated synthetically
-   - Real farm data is unavailable
-   - **Solution**: Integrate with real accounting systems
-
-2. **External API Dependency**
-   - LLM explanations require alem.plus API
-   - Explanations don't work without internet
-   - **Solution**: Local LLM (e.g., Llama 3)
-
-3. **Scalability**
-   - LightGBM runs on single server
-   - >100k applications will require distributed architecture
-   - **Solution**: Spark ML or cloud ML services
-
-4. **Regional Coverage**
-   - Legislative norms may vary by region
-   - Not all regions covered in `laws.py`
-   - **Solution**: Expand norms database
-
-### Known Issues
-
-| Issue | Status | Workaround |
-|-------|--------|------------|
-| Cyrillic in PDF | ✅ Fixed | Uses DejaVuSans font |
-| Slow LLM explanations | ⚠️ Monitored | 1-hour cache, SSE |
-| Large Excel files (>50MB) | ⚠️ Limited | Split into parts	|
-
----
-
-## 📊 Evaluation Criteria
-
-Per Decentrathon 5.0 requirements:
-
-| Criterion | Weight | What's Evaluated | How We Meet It |
-|-----------|--------|------------------|----------------|
-| **Problem & Value** | 15 | Task understanding and practical value | ✅ Solves real FIFO → Merit problem |
-| **Data Work** | 15 | Data processing quality, sources, features | ✅ 20 features, synthetic + real data |
-| **Model & Logic** | 20 | Approach validity, correctness | ✅ LightGBM + 2-stage scoring + CV |
-| **Explainability** | 15 | Explanation clarity | ✅ SHAP + LLM + Streaming |
-| **Technical Implementation** | 15 | Working prototype, stability | ✅ Full stack, Docker, CI/CD ready |
-| **Demo & UX** | 10 | Usage clarity | ✅ Intuitive UI, dashboards, charts |
-| **Documentation** | 10 | README, launch, data, limitations | ✅ **This documentation** 🚀 |
-| **TOTAL** | **100** | | |
-
----
-
-## 🙏 Acknowledgments
-
-- **OskemenHUB** — за помощь в съемке демо-материалов и поддержку проекта
-- **Decentrathon 5.0** — за площадку для инноваций
-- **inDrive** — за вдохновение и поддержку
-
----
-
-## 📞 Contacts
-
-- **https://datanomads.cc**
-
----
-
-**Made with ❤️ for Decentrathon 5.0**
+Proprietary, all rights reserved. The source is published for viewing only. See [LICENSE](LICENSE).
